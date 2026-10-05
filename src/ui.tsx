@@ -112,6 +112,7 @@ function Layout({ title, nav = true, children }: { title: string; nav?: boolean;
 				<meta charset="utf-8" />
 				<meta name="viewport" content="width=device-width, initial-scale=1" />
 				<title>{title} · Agent Dashboard</title>
+				<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 				<style dangerouslySetInnerHTML={{ __html: CSS }} />
 			</head>
 			<body>
@@ -216,6 +217,12 @@ const SUMMARIES_SQL = `SELECT s.project_id, k.agent, s.headline, s.fields, s.upd
 	FROM summaries s JOIN api_keys k ON k.id = s.key_id WHERE k.revoked_at IS NULL`;
 
 export const ui = new Hono();
+
+const FAVICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#2a5bd7"/><g fill="#fff"><circle cx="8.5" cy="10" r="2.5"/><rect x="13.5" y="8" width="12" height="4" rx="2"/><circle cx="8.5" cy="22" r="2.5"/><rect x="13.5" y="20" width="8" height="4" rx="2"/></g><path d="M5 16h22" stroke="#fff" stroke-opacity=".35" stroke-width="1.5"/></svg>`;
+
+ui.get("/favicon.svg", (c) =>
+	c.body(FAVICON, 200, { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" }),
+);
 
 ui.get("/login", (c) =>
 	c.html(
