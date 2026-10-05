@@ -397,6 +397,98 @@ test("an agent that predates a release is told about it in the inbox, once", asy
 	assert.ok((await newcomer("GET", "/inbox?all=true")).json.messages.every((m: any) => m.kind !== "changes"));
 });
 
+test("the dashboard notices agent updates and counts what needs the owner", async () => {
+	const api = await makeKey("live-agent");
+	const live = async (token = "") => JSON.parse((await owner(`/live?t=${token}`)).text) as { token: string; needs?: number; seen: Record<string, string> };
+	const count = (html: string) => Number(html.match(/<title>\((\d+)\) /)?.[1] ?? 0);
+
+	const before = await live();
+	assert.equal(typeof before.needs, "number");
+	const same = await live(before.token);
+	assert.equal(same.token, before.token);
+	assert.equal(same.needs, undefined, "nothing changed, nothing counted");
+	assert.equal(count(await page()), before.needs);
+
+	await api("POST", "/items", { type: "question", title: "Ship it?" });
+	const after = await live(before.token);
+	assert.notEqual(after.token, before.token);
+	assert.equal(after.needs, before.needs! + 1);
+	const html = await page();
+	assert.equal(count(html), after.needs);
+	assert.match(html, new RegExp(`<script data-token="[0-9a-f]{16}" data-needs="${after.needs}"`));
+	// The icon the page switches to when something new needs the owner.
+	const icons = await Promise.all(["/favicon.svg", "/favicon-alert.svg"].map((path) => fetch(BASE + path).then((r) => r.text())));
+	assert.ok(icons.every((icon) => icon.startsWith("<svg")) && icons[0] !== icons[1]);
+
+	await api("POST", "/heartbeat", { status: "thinking" });
+	const status = await live(after.token);
+	assert.notEqual(status.token, after.token);
+	await api("POST", "/heartbeat", {});
+	const quiet = await live(status.token);
+	assert.equal(quiet.token, status.token, "a repeated heartbeat does not reload the page");
+
+	// Times are sent as timestamps for the page script to keep current, and the
+	// agent's last call reaches the page without a reload.
+	const stamp = (await page()).match(/data-at="([^"]+)" data-agent="(\d+)"/);
+	assert.ok(stamp, "agent line carries its key id");
+	assert.ok(Object.values(quiet.seen).every((at) => !Number.isNaN(Date.parse(at))));
+	assert.ok(stamp![2] in quiet.seen);
+
+	// The page that shows a new key once must never reload itself.
+	const created = await owner("/keys", { agent: "live-other", projects: [project.id] });
+	assert.match(created.text, /adk_[0-9a-f]{48}/);
+	assert.doesNotMatch(created.text, /data-token=/);
+	assert.doesNotMatch((await fetch(`${BASE}/login`).then((r) => r.text())), /data-token=/);
+});
+
+test("the owner can look at one stage at a time, and actions return to the same view", async () => {
+	const api = await makeKey("stager");
+	const working = (await api("POST", "/items", { type: "working_on", title: `Building ${run}` })).json;
+	const waiting = (await api("POST", "/items", { type: "waiting", title: `Parked ${run}` })).json;
+	const question = (await api("POST", "/items", { type: "question", title: `Asking ${run}` })).json;
+
+	const view = `/p/${project.slug}?stage=waiting`;
+	const html = (await owner(view)).text;
+	for (const stage of ["needs", "working_on", "waiting", "upcoming", "decision", "done", "note", "settled"])
+		assert.ok(html.includes(`stage=${stage}"`), `filter for ${stage}`);
+	assert.ok(html.includes(`Parked ${run}`) && !html.includes(`Building ${run}`) && !html.includes(`Asking ${run}`));
+	assert.ok((await owner(`/p/${project.slug}?stage=needs`)).text.includes(`Asking ${run}`));
+
+	// Only what was on screen counts as seen.
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	assert.equal((await api("GET", `/items/${waiting.id}`)).json.seen_by_owner, true);
+	assert.equal((await api("GET", `/items/${working.id}`)).json.seen_by_owner, false);
+
+	// An action comes back to the filtered view, with no anchor to jump to.
+	const response = await fetch(`${BASE}/items/${question.id}/resolve`, {
+		method: "POST",
+		headers: { Cookie: cookie, Referer: BASE + view },
+		redirect: "manual",
+	});
+	assert.equal(response.headers.get("location"), view);
+	assert.ok((await owner(`/p/${project.slug}?stage=settled`)).text.includes(`Asking ${run}`));
+});
+
+test("the owner can archive everything answered and resolved at once", async () => {
+	const api = await makeKey("settler");
+	const make = async (body: Record<string, unknown>) => (await api("POST", "/items", body)).json.id as number;
+	const resolved = await make({ type: "blocker", title: `Unblocked ${run}`, resolved: true });
+	const answered = await make({ type: "question", title: `Answered ${run}`, options: [{ id: "y", label: "Yes" }, { id: "n", label: "No" }] });
+	const open = await make({ type: "question", title: `Open ${run}` });
+	const blocked = await make({ type: "question", title: `Stuck ${run}`, resolved: true, blocked: "waiting on access" });
+	const done = await make({ type: "done", title: `Finished ${run}` });
+	await owner(`/items/${answered}/answer`, { selected: "y" });
+	await api("POST", "/inbox/ack", { all: true });
+
+	assert.ok((await page()).includes(`action="/p/${project.slug}/archive-settled"`));
+	assert.equal((await owner(`/p/${project.slug}/archive-settled`, {})).status, 302);
+	const archived = async (id: number) => (await api("GET", `/items/${id}`)).json.archived;
+	assert.deepEqual(await Promise.all([resolved, answered, open, blocked, done].map(archived)), [true, true, false, false, false]);
+
+	const inbox = (await api("GET", "/inbox")).json.messages.filter((m: any) => m.kind === "archived");
+	assert.deepEqual(inbox.map((m: any) => m.item_id).sort(), [resolved, answered].sort());
+});
+
 test("help covers every topic, endpoint and the changelog", async () => {
 	const index = await (await fetch(`${BASE}/api/help`)).text();
 	for (const topic of ["auth", "items", "keys", "questions", "decisions", "comments", "inbox", "heartbeat", "summary", "limits", "conventions", "changes"]) {

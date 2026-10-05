@@ -6,6 +6,7 @@ import {
 	ITEM_SELECT,
 	all,
 	first,
+	marks,
 	now,
 	run,
 	sha256,
@@ -13,7 +14,7 @@ import {
 	type ItemRow,
 } from "./db.ts";
 import { LATEST_VERSION, MADE_BY, TOPICS, helpIndex, helpTopic } from "./help.ts";
-import { DEFAULT_STALE_MINUTES, GROUPS, groupOf, isStale, renderMarkdown } from "./lib.ts";
+import { DEFAULT_STALE_MINUTES, GROUPS, groupOf, isStale, needsOwner, renderMarkdown } from "./lib.ts";
 
 type Project = { id: number; slug: string; name: string; work_stale_hours: number };
 type KeyRow = {
@@ -58,6 +59,7 @@ header { display:flex; gap:20px; align-items:center; padding:12px 24px; border-b
 header strong { margin-right:auto; }
 header form { margin:0; }
 main { max-width:1100px; margin:0 auto; padding:24px; }
+button.live { position:fixed; right:20px; bottom:20px; z-index:10; box-shadow:0 2px 10px rgba(0,0,0,.25); }
 h1 { font-size:22px; margin:0 0 16px; } h2 { font-size:16px; margin:0 0 8px; }
 h2.group { margin:28px 0 10px; padding-bottom:4px; border-bottom:1px solid var(--line); }
 h3 { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin:14px 0 4px; }
@@ -79,7 +81,7 @@ pre.code { font:13px/1.5 ui-monospace,monospace; overflow-x:auto; white-space:pr
 .comment.user { border-color:var(--accent); }
 .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
 .actions { margin-top:10px; gap:14px; }
-.filters { margin-bottom:16px; } .filters a { margin-right:12px; } .filters a.on { font-weight:600; color:var(--text); }
+.filters { margin-bottom:16px; } .filters a { margin-right:12px; white-space:nowrap; } .filters a.on { font-weight:600; color:var(--text); }
 input,textarea,select,button { font:inherit; padding:6px 10px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--text); }
 input[type=checkbox] { padding:0; }
 textarea { width:100%; min-height:60px; } button { cursor:pointer; } button.link { border:0; background:none; color:var(--accent); padding:0; }
@@ -101,17 +103,134 @@ function ago(iso: string): string {
 	return `${Math.floor(seconds / 86400)}d ago`;
 }
 
-const When = ({ at }: { at: string }) => <span title={at}>{ago(at)}</span>;
+// The page script keeps these ticking. `agent` is a key id: its time is
+// replaced with the key's latest call whenever the script polls.
+const When = ({ at, agent }: { at: string; agent?: number }) => (
+	<span title={at} data-at={at} data-agent={agent}>
+		{ago(at)}
+	</span>
+);
 
 const Badge = ({ type }: { type: string }) => <span class={`badge ${type}`}>{LABELS[type] ?? type}</span>;
 
-function Layout({ title, nav = true, children }: { title: string; nav?: boolean; children?: Child }) {
+type Live = { token: string; needs: number };
+
+// Changes whenever something an agent or the owner did would alter a page.
+// Every part is one index row or a table with a row per agent, so polling it
+// stays cheap. Heartbeat times are left out: they would reload on every call.
+async function liveToken(): Promise<string> {
+	const row = await first<Record<string, unknown>>(
+		`SELECT (SELECT MAX(updated_at) FROM items) AS items,
+		        (SELECT MAX(id) FROM comments) AS comments,
+		        (SELECT MAX(id) FROM messages) AS messages,
+		        (SELECT MAX(updated_at) FROM summaries) AS summaries,
+		        (SELECT group_concat(status, char(10)) FROM agent_status) AS statuses`,
+	);
+	return (await sha256(JSON.stringify(row))).slice(0, 16);
+}
+
+// How many items are waiting on the owner, across all projects.
+async function needsCount(): Promise<number> {
+	const rows = await all<ItemRow>(
+		"SELECT type, archived_at, resolved_at, answer, blocked, needs_review FROM items WHERE archived_at IS NULL",
+	);
+	return rows.filter(needsOwner).length;
+}
+
+// Read before a page's own queries, so a change that lands in between causes
+// one extra reload rather than being missed.
+const liveState = async (): Promise<Live> => ({ token: await liveToken(), needs: await needsCount() });
+
+const counted = (needs: number, title: string) => (needs ? `(${needs}) ${title}` : title);
+
+// Polls /live and reloads when something changed. A hidden tab only updates
+// its title, so items are not marked as seen while nobody is looking, and a
+// page with a form in use offers the reload instead of taking it. Each poll
+// also brings the "5m ago" stamps and the agents' stale markers up to date.
+// Submitting a form remembers how far the page was scrolled, and the page it
+// comes back to starts there instead of at the top. When more needs the owner
+// than before and they are not on the tab, the icon gets a dot until they are.
+const LIVE_JS = `(() => {
+const here = location.pathname + location.search;
+const [path, y] = JSON.parse(sessionStorage.getItem("scroll") ?? "[]");
+sessionStorage.removeItem("scroll");
+if (path === here) scrollTo(0, y);
+document.addEventListener("submit", () => sessionStorage.setItem("scroll", JSON.stringify([here, scrollY])));
+const ago = ${ago};
+const tick = () => {
+	for (const time of document.querySelectorAll("[data-at]")) time.textContent = ago(time.dataset.at);
+	for (const line of document.querySelectorAll("[data-stale-after]")) {
+		const time = line.querySelector("[data-at]");
+		if (!time) continue;
+		const stale = Date.now() - Date.parse(time.dataset.at) > line.dataset.staleAfter * 60000;
+		const note = line.querySelector(".stale-note");
+		line.querySelector(".dot").classList.toggle("stale", stale);
+		if (stale && !note) time.insertAdjacentHTML("afterend", '<span class="stale-note"> · stale</span>');
+		if (!stale) note?.remove();
+	}
+};
+const script = document.currentScript, base = script.dataset.title;
+let token = script.dataset.token, pending = false, note;
+let needs = Number(script.dataset.needs), alerted = false;
+const icon = document.querySelector("link[rel=icon]");
+const away = () => document.hidden || !document.hasFocus();
+const alert = (on) => {
+	if (on === alerted) return;
+	alerted = on;
+	on ? sessionStorage.setItem("alert", "1") : sessionStorage.removeItem("alert");
+	icon.href = on ? "/favicon-alert.svg" : "/favicon.svg";
+};
+alert(!!sessionStorage.getItem("alert") && away());
+if (!alerted) sessionStorage.removeItem("alert");
+for (const type of ["pointermove", "pointerdown", "keydown", "focus"]) addEventListener(type, () => alert(false));
+const dirty = (f) => f.type === "checkbox" || f.type === "radio" ? f.checked !== f.defaultChecked
+	: f.tagName === "SELECT" ? f.selectedIndex !== Math.max(0, [...f.options].findIndex((o) => o.defaultSelected))
+	: f.type !== "hidden" && f.value !== f.defaultValue;
+const busy = () => /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName ?? "")
+	|| [...document.querySelectorAll("input,textarea,select")].some(dirty);
+const apply = () => {
+	if (!pending || document.hidden) return;
+	if (!busy()) return location.reload();
+	if (note) return;
+	note = document.createElement("button");
+	note.className = "live";
+	note.textContent = "New updates · reload";
+	note.onclick = () => location.reload();
+	document.body.append(note);
+};
+const poll = async () => {
+	try {
+		const response = await fetch("/live?t=" + token);
+		if (response.ok && !response.redirected) {
+			const state = await response.json();
+			for (const time of document.querySelectorAll("[data-agent]")) {
+				const at = state.seen[time.dataset.agent];
+				if (at) time.dataset.at = time.title = at;
+			}
+			if (state.token !== token) {
+				token = state.token;
+				pending = true;
+				document.title = (state.needs ? "(" + state.needs + ") " : "") + base;
+				if (state.needs > needs && away()) alert(true);
+				needs = state.needs;
+			}
+		}
+	} catch {}
+	tick();
+	apply();
+};
+setInterval(poll, 30000);
+document.addEventListener("visibilitychange", () => document.hidden || (alert(false), poll()));
+})();`;
+
+function Layout({ title, nav = true, live, children }: { title: string; nav?: boolean; live?: Live; children?: Child }) {
+	const full = `${title} · Agent Dashboard`;
 	return (
 		<html lang="en">
 			<head>
 				<meta charset="utf-8" />
 				<meta name="viewport" content="width=device-width, initial-scale=1" />
-				<title>{title} · Agent Dashboard</title>
+				<title>{counted(live?.needs ?? 0, full)}</title>
 				<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 				<style dangerouslySetInnerHTML={{ __html: CSS }} />
 			</head>
@@ -128,6 +247,7 @@ function Layout({ title, nav = true, children }: { title: string; nav?: boolean;
 					</header>
 				)}
 				<main>{children}</main>
+				{live && <script data-token={live.token} data-needs={live.needs} data-title={full} dangerouslySetInnerHTML={{ __html: LIVE_JS }} />}
 			</body>
 		</html>
 	);
@@ -137,12 +257,12 @@ function Layout({ title, nav = true, children }: { title: string; nav?: boolean;
 function AgentLine({ agent }: { agent: AgentRow }) {
 	const stale = isStale(agent.last_used_at, agent.stale_after_minutes ?? DEFAULT_STALE_MINUTES);
 	return (
-		<div>
+		<div data-stale-after={agent.stale_after_minutes ?? DEFAULT_STALE_MINUTES}>
 			<span class={`dot ${stale ? "stale" : ""}`} />
 			<strong>{agent.agent}</strong>{" "}
 			<span class="muted">
-				{agent.last_used_at ? <When at={agent.last_used_at} /> : "never seen"}
-				{stale && " · stale"}
+				{agent.last_used_at ? <When at={agent.last_used_at} agent={agent.id} /> : "never seen"}
+				{stale && <span class="stale-note"> · stale</span>}
 				{agent.status && ` · ${agent.status}`}
 			</span>
 		</div>
@@ -177,15 +297,16 @@ const slugify = (name: string) =>
 		.replace(/[^a-z0-9]+/g, "-")
 		.replace(/^-|-$/g, "");
 
-// Send the user back to the page the form was on.
-function back(c: Context, fallback: string, anchor = "") {
+// Send the user back to the page the form was on. The page script puts the
+// scroll position back, so there is no anchor to jump to.
+function back(c: Context, fallback: string) {
 	const referer = c.req.header("Referer");
 	const here = new URL(c.req.url);
 	if (referer) {
 		const url = new URL(referer);
-		if (url.origin === here.origin) return c.redirect(url.pathname + url.search + anchor);
+		if (url.origin === here.origin) return c.redirect(url.pathname + url.search);
 	}
-	return c.redirect(fallback + anchor);
+	return c.redirect(fallback);
 }
 
 async function field(c: Context, name: string): Promise<string> {
@@ -218,11 +339,17 @@ const SUMMARIES_SQL = `SELECT s.project_id, k.agent, s.headline, s.fields, s.upd
 
 export const ui = new Hono();
 
-const FAVICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#2a5bd7"/><g fill="#fff"><circle cx="8.5" cy="10" r="2.5"/><rect x="13.5" y="8" width="12" height="4" rx="2"/><circle cx="8.5" cy="22" r="2.5"/><rect x="13.5" y="20" width="8" height="4" rx="2"/></g><path d="M5 16h22" stroke="#fff" stroke-opacity=".35" stroke-width="1.5"/></svg>`;
+// The second icon carries a red dot: the page script switches to it when
+// something new needs the owner while they are looking elsewhere.
+const favicon = (dot: string) =>
+	`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#2a5bd7"/><g fill="#fff"><circle cx="8.5" cy="10" r="2.5"/><rect x="13.5" y="8" width="12" height="4" rx="2"/><circle cx="8.5" cy="22" r="2.5"/><rect x="13.5" y="20" width="8" height="4" rx="2"/></g><path d="M5 16h22" stroke="#fff" stroke-opacity=".35" stroke-width="1.5"/>${dot}</svg>`;
+const ICONS: Record<string, string> = {
+	"/favicon.svg": favicon(""),
+	"/favicon-alert.svg": favicon(`<circle cx="23" cy="9" r="8" fill="#ff3b30" stroke="#fff" stroke-width="2"/>`),
+};
 
-ui.get("/favicon.svg", (c) =>
-	c.body(FAVICON, 200, { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" }),
-);
+for (const [path, icon] of Object.entries(ICONS))
+	ui.get(path, (c) => c.body(icon, 200, { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" }));
 
 ui.get("/login", (c) =>
 	c.html(
@@ -250,7 +377,19 @@ ui.post("/logout", (c) => {
 	return c.redirect("/login");
 });
 
+// What the page script polls: when each key last called, and the token. The
+// count is only worked out when something changed.
+ui.get("/live", async (c) => {
+	const token = await liveToken();
+	const keys = await all<{ id: number; last_used_at: string }>(
+		"SELECT id, last_used_at FROM api_keys WHERE revoked_at IS NULL AND last_used_at IS NOT NULL",
+	);
+	const seen = Object.fromEntries(keys.map((key) => [key.id, key.last_used_at]));
+	return c.json(token === c.req.query("t") ? { token, seen } : { token, seen, needs: await needsCount() });
+});
+
 ui.get("/", async (c) => {
+	const live = await liveState();
 	const projects = await all<Project>("SELECT * FROM projects ORDER BY name");
 	const items = await all<ItemRow>(`${ITEM_SELECT} WHERE i.archived_at IS NULL ${ITEM_ORDER} LIMIT 1000`);
 	const agents = await all<AgentRow>(`${AGENTS_SQL} ORDER BY k.agent`);
@@ -276,7 +415,7 @@ ui.get("/", async (c) => {
 		) : null;
 
 	return c.html(
-		<Layout title="Overview">
+		<Layout title="Overview" live={live}>
 			<h1>Overview</h1>
 			{!projects.length && (
 				<p>
@@ -476,7 +615,8 @@ function ItemCard(props: { item: ItemRow; comments: CommentRow[]; history: Histo
 ui.get("/p/:slug", async (c) => {
 	const project = await first<Project>("SELECT * FROM projects WHERE slug = ?", c.req.param("slug"));
 	if (!project) return c.notFound();
-	const { agent, made_by: madeBy, review, archived } = c.req.query();
+	const live = await liveState();
+	const { agent, made_by: madeBy, review, archived, stage } = c.req.query();
 
 	const where = ["i.project_id = ?"];
 	const params: unknown[] = [project.id];
@@ -486,7 +626,10 @@ ui.get("/p/:slug", async (c) => {
 	where.push(archived ? "i.archived_at IS NOT NULL" : "i.archived_at IS NULL");
 	const filter = where.join(" AND ");
 
-	const items = await all<ItemRow>(`${ITEM_SELECT} WHERE ${filter} ${ITEM_ORDER} LIMIT 500`, ...params);
+	const matching = await all<ItemRow>(`${ITEM_SELECT} WHERE ${filter} ${ITEM_ORDER} LIMIT 500`, ...params);
+	// Archived items are grouped by what they were before they were archived.
+	const inGroup = (group: string) => matching.filter((item) => groupOf({ ...item, archived_at: null }) === group);
+	const items = stage ? inGroup(stage) : matching;
 	const comments = await all<CommentRow>(
 		`SELECT c.* FROM comments c JOIN items i ON i.id = c.item_id WHERE ${filter} ORDER BY c.created_at`,
 		...params,
@@ -505,11 +648,19 @@ ui.get("/p/:slug", async (c) => {
 		project.id,
 	);
 	// The owner has now had these on screen; agents see it as seen_by_owner.
-	if (!archived) c.executionCtx.waitUntil(run(`UPDATE items AS i SET seen_at = ? WHERE ${filter}`, now(), ...params));
+	// With a stage chosen, only that stage was on screen.
+	const seen = async () => {
+		if (!stage) return void (await run(`UPDATE items AS i SET seen_at = ? WHERE ${filter}`, now(), ...params));
+		for (let from = 0; from < items.length; from += 90) {
+			const ids = items.slice(from, from + 90).map((item) => item.id);
+			await run(`UPDATE items SET seen_at = ? WHERE id IN (${marks(ids)})`, now(), ...ids);
+		}
+	};
+	if (!archived) c.executionCtx.waitUntil(seen());
 
 	const link = (changes: Record<string, string | undefined>) => {
 		const query = new URLSearchParams();
-		for (const [key, value] of Object.entries({ agent, made_by: madeBy, review, archived, ...changes }))
+		for (const [key, value] of Object.entries({ agent, made_by: madeBy, review, archived, stage, ...changes }))
 			if (value) query.set(key, value);
 		const text = query.toString();
 		return `/p/${project.slug}${text && `?${text}`}`;
@@ -522,7 +673,7 @@ ui.get("/p/:slug", async (c) => {
 	const names = [...new Set(agents.map((row) => row.agent))];
 
 	return c.html(
-		<Layout title={project.name}>
+		<Layout title={project.name} live={live}>
 			<h1>{project.name}</h1>
 			<div class="card">
 				{agents.map((row) => (
@@ -561,6 +712,17 @@ ui.get("/p/:slug", async (c) => {
 				</Filter>
 			</div>
 
+			<div class="filters">
+				<Filter on={!stage} to={{ stage: undefined }}>
+					All stages
+				</Filter>
+				{GROUPS.map(([group, label]) => (
+					<Filter on={stage === group} to={{ stage: group }}>
+						{label} ({inGroup(group).length})
+					</Filter>
+				))}
+			</div>
+
 			<details class="card">
 				<summary>Send a note to agents</summary>
 				<form method="post" action={`/p/${project.slug}/note`} class="stack">
@@ -588,15 +750,15 @@ ui.get("/p/:slug", async (c) => {
 
 			{!items.length && <p class="muted">No items match.</p>}
 			{GROUPS.map(([group, label]) => {
-				const rows = items.filter((item) => groupOf({ ...item, archived_at: null }) === group);
+				const rows = stage && stage !== group ? [] : inGroup(group);
 				if (!rows.length) return null;
 				return (
 					<section id={`group-${group}`}>
 						<h2 class="group row">
 							{label} ({rows.length})
-							{group === "done" && !archived && (
-								<form method="post" action={`/p/${project.slug}/archive-done`} class="inline" style="margin-left:auto">
-									<button class="link">Archive all done</button>
+							{(group === "done" || group === "settled") && !archived && (
+								<form method="post" action={`/p/${project.slug}/archive-${group}`} class="inline" style="margin-left:auto">
+									<button class="link">Archive all {group === "done" ? "done" : "answered and resolved"}</button>
 								</form>
 							)}
 						</h2>
@@ -632,9 +794,10 @@ ui.post("/p/:slug/note", async (c) => {
 	return back(c, `/p/${project.slug}`);
 });
 
-ui.post("/p/:slug/archive-done", async (c) => {
+// Archives every active item of a project that matches `which`, telling each agent.
+async function archiveAll(c: Context, which: string) {
 	const at = now();
-	const scope = `type = 'done' AND archived_at IS NULL AND project_id = (SELECT id FROM projects WHERE slug = ?)`;
+	const scope = `${which} AND archived_at IS NULL AND project_id = (SELECT id FROM projects WHERE slug = ?)`;
 	await run(
 		`INSERT INTO messages (project_id, key_id, item_id, kind, body, created_at)
 		 SELECT project_id, key_id, id, 'archived', 'The user archived this item.', ? FROM items WHERE ${scope}`,
@@ -643,7 +806,18 @@ ui.post("/p/:slug/archive-done", async (c) => {
 	);
 	await run(`UPDATE items SET archived_at = ? WHERE ${scope}`, at, c.req.param("slug"));
 	return back(c, `/p/${c.req.param("slug")}`);
-});
+}
+
+ui.post("/p/:slug/archive-done", (c) => archiveAll(c, "type = 'done'"));
+
+// The "settled" group of groupOf: questions and blockers no longer waiting on the owner.
+ui.post("/p/:slug/archive-settled", (c) =>
+	archiveAll(
+		c,
+		`type IN ('question', 'blocker') AND COALESCE(blocked, '') = '' AND needs_review = 0
+		 AND (resolved_at IS NOT NULL OR COALESCE(answer, '') <> '')`,
+	),
+);
 
 ui.post("/items/:id/archive", async (c) => {
 	const item = await loadItem(c.req.param("id"));
@@ -667,7 +841,7 @@ ui.post("/items/:id/unarchive", async (c) => {
 
 ui.post("/items/:id/pin", async (c) => {
 	await run("UPDATE items SET pinned = 1 - pinned WHERE id = ?", c.req.param("id"));
-	return back(c, "/", `#item-${c.req.param("id")}`);
+	return back(c, "/");
 });
 
 ui.post("/items/:id/resolve", async (c) => {
@@ -680,7 +854,7 @@ ui.post("/items/:id/resolve", async (c) => {
 		resolving ? "resolved" : "reopened",
 		resolving ? "The user marked this as resolved." : "The user reopened this.",
 	);
-	return back(c, `/p/${item.project}`, `#item-${item.id}`);
+	return back(c, `/p/${item.project}`);
 });
 
 ui.post("/items/:id/answer", async (c) => {
@@ -700,7 +874,7 @@ ui.post("/items/:id/answer", async (c) => {
 		);
 		await notify(item, "answer", `Answer: ${[...labels, text].filter(Boolean).join("; ")}`, { selected, text });
 	}
-	return back(c, `/p/${item.project}`, `#item-${item.id}`);
+	return back(c, `/p/${item.project}`);
 });
 
 ui.post("/items/:id/review", async (c) => {
@@ -715,7 +889,7 @@ ui.post("/items/:id/review", async (c) => {
 		item.id,
 	);
 	await notify(item, "review", `The user ${verdict} this decision${comment && `: ${comment}`}`, { verdict, comment });
-	return back(c, `/p/${item.project}`, `#item-${item.id}`);
+	return back(c, `/p/${item.project}`);
 });
 
 // A comment is stored on the item's thread and delivered to the inbox of the
@@ -736,10 +910,12 @@ ui.post("/items/:id/comment", async (c) => {
 		);
 		await notify(item, "comment", body, { needs_reply: needsReply });
 	}
-	return back(c, `/p/${item.project}`, `#item-${item.id}`);
+	return back(c, `/p/${item.project}`);
 });
 
 async function keysPage(c: Context, created?: { agent: string; token: string }, error?: string) {
+	// Only a page reached by GET can be reloaded; a form result would be resubmitted.
+	const live = c.req.method === "GET" ? await liveState() : undefined;
 	const projects = await all<Project>("SELECT * FROM projects ORDER BY name");
 	const keys = await all<KeyRow>(
 		`SELECT k.*, (SELECT GROUP_CONCAT(p.slug, ', ') FROM key_projects kp
@@ -748,7 +924,7 @@ async function keysPage(c: Context, created?: { agent: string; token: string }, 
 	);
 	const origin = new URL(c.req.url).origin;
 	return c.html(
-		<Layout title="Projects & keys">
+		<Layout title="Projects & keys" live={live}>
 			<h1>Projects &amp; keys</h1>
 			{error && <div class="card notice">{error}</div>}
 			{created && (
@@ -810,7 +986,7 @@ Run: curl -s ${origin}/api/help  and follow it.`}</pre>
 								<code>{key.key_prefix}…</code>
 							</td>
 							<td>{key.projects}</td>
-							<td>{key.last_used_at ? <When at={key.last_used_at} /> : "never"}</td>
+							<td>{key.last_used_at ? <When at={key.last_used_at} agent={key.id} /> : "never"}</td>
 							<td>
 								{key.revoked_at ? (
 									"revoked"
@@ -912,10 +1088,11 @@ ui.post("/keys/:id/revoke", async (c) => {
 	return c.redirect("/keys");
 });
 
-ui.get("/docs", (c) => {
+ui.get("/docs", async (c) => {
+	const live = await liveState();
 	const origin = new URL(c.req.url).origin;
 	return c.html(
-		<Layout title="API docs">
+		<Layout title="API docs" live={live}>
 			<h1>API docs</h1>
 			<p class="muted">
 				This is what agents read at <a href="/api/help">/api/help</a>.
