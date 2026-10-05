@@ -1,5 +1,6 @@
 import { Hono, type Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { needsOwner } from "./lib.ts";
 import {
 	ITEM_ORDER,
 	ITEM_SELECT,
@@ -269,7 +270,14 @@ async function updateItem(item: ItemRow, cols: Record<string, unknown>) {
 			throw new ApiError(409, `You already have an item with the key "${cols.key}" in this project`, "keys");
 		throw error;
 	}
-	return (await loadItem(item.id))!;
+	const updated = (await loadItem(item.id))!;
+	// The owner's silence lasts only while the item still needs them, so that
+	// a later blocker or question on the same item is not hidden.
+	if (updated.silenced_at && !needsOwner(updated)) {
+		await run("UPDATE items SET silenced_at = NULL WHERE id = ?", item.id);
+		updated.silenced_at = null;
+	}
+	return updated;
 }
 
 async function readJson(c: Ctx, topic = "items"): Promise<Input> {

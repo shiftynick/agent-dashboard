@@ -52,6 +52,7 @@ export type ItemRow = {
 	needs_review: number;
 	review: string | null;
 	seen_at: string | null;
+	silenced_at: string | null;
 };
 
 export type CommentRow = {

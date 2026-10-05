@@ -415,14 +415,36 @@ test("the dashboard notices agent updates and counts what needs the owner", asyn
 	assert.equal(after.needs, before.needs! + 1);
 	const html = await page();
 	assert.equal(count(html), after.needs);
-	assert.match(html, new RegExp(`<script data-token="[0-9a-f]{16}" data-needs="${after.needs}"`));
-	// The icon the page switches to when something new needs the owner.
+	assert.match(html, /<script data-token="[0-9a-f]{16}"/);
 	const icons = await Promise.all(["/favicon.svg", "/favicon-alert.svg"].map((path) => fetch(BASE + path).then((r) => r.text())));
 	assert.ok(icons.every((icon) => icon.startsWith("<svg")) && icons[0] !== icons[1]);
 
+	// The icon's dot is on while anything needs the owner, until they silence it.
+	const question = (await api("GET", "/items?mine=true")).json.items.find((item: { title: string }) => item.title === "Ship it?");
+	assert.match(html, /rel="icon"[^>]*href="\/favicon-alert\.svg"/);
+	await owner(`/items/${question.id}/silence`, {});
+	const silenced = await live(after.token);
+	assert.notEqual(silenced.token, after.token, "other tabs hear about it");
+	assert.equal(silenced.needs, before.needs);
+	const quietPage = await page();
+	assert.equal(count(quietPage), before.needs);
+	assert.match(quietPage, />silenced<\/span>/);
+	assert.match(quietPage, />Unsilence</);
+	if (!before.needs) assert.match(quietPage, /rel="icon"[^>]*href="\/favicon\.svg"/);
+	assert.equal((await api("GET", `/items/${question.id}`)).json.silenced_at, undefined, "the agent is not told");
+	await owner(`/items/${question.id}/silence`, {});
+	assert.equal((await live(silenced.token)).needs, after.needs, "unsilenced, it counts again");
+	// Silence ends once the item stops needing the owner, so a later blocker shows.
+	await owner(`/items/${question.id}/silence`, {});
+	await api("PATCH", `/items/${question.id}`, { resolved: true });
+	await api("PATCH", `/items/${question.id}`, { blocked: "need the prod password" });
+	const blocked = await live();
+	assert.equal(blocked.needs, after.needs);
+	assert.doesNotMatch(await page(), />silenced<\/span>/);
+
 	await api("POST", "/heartbeat", { status: "thinking" });
-	const status = await live(after.token);
-	assert.notEqual(status.token, after.token);
+	const status = await live(blocked.token);
+	assert.notEqual(status.token, blocked.token);
 	await api("POST", "/heartbeat", {});
 	const quiet = await live(status.token);
 	assert.equal(quiet.token, status.token, "a repeated heartbeat does not reload the page");

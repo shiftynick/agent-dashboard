@@ -67,7 +67,7 @@ h4 { font-size:15px; margin:10px 0 4px; }
 .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:16px; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:12px; }
 .grid .card { margin:0; }
-.card.needs { border-left:4px solid var(--warn); }
+.card.needs { border-left:4px solid var(--warn); } .card.needs.silenced { border-left-color:var(--line); }
 .muted { color:var(--muted); font-size:13px; }
 ul.plain { list-style:none; margin:0; padding:0; } ul.plain li { padding:2px 0; }
 .badge { display:inline-block; font-size:12px; padding:1px 8px; border-radius:10px; border:1px solid var(--line); margin-right:6px; white-space:nowrap; }
@@ -124,15 +124,18 @@ async function liveToken(): Promise<string> {
 		        (SELECT MAX(id) FROM comments) AS comments,
 		        (SELECT MAX(id) FROM messages) AS messages,
 		        (SELECT MAX(updated_at) FROM summaries) AS summaries,
+		        (SELECT COUNT(*) || ' ' || MAX(silenced_at) FROM items WHERE silenced_at IS NOT NULL) AS silenced,
 		        (SELECT group_concat(status, char(10)) FROM agent_status) AS statuses`,
 	);
 	return (await sha256(JSON.stringify(row))).slice(0, 16);
 }
 
-// How many items are waiting on the owner, across all projects.
+// How many items are waiting on the owner, across all projects, leaving out
+// the ones they silenced. The tab title shows it and the icon's dot follows it.
 async function needsCount(): Promise<number> {
 	const rows = await all<ItemRow>(
-		"SELECT type, archived_at, resolved_at, answer, blocked, needs_review FROM items WHERE archived_at IS NULL",
+		`SELECT type, archived_at, resolved_at, answer, blocked, needs_review FROM items
+		 WHERE archived_at IS NULL AND silenced_at IS NULL`,
 	);
 	return rows.filter(needsOwner).length;
 }
@@ -148,8 +151,8 @@ const counted = (needs: number, title: string) => (needs ? `(${needs}) ${title}`
 // page with a form in use offers the reload instead of taking it. Each poll
 // also brings the "5m ago" stamps and the agents' stale markers up to date.
 // Submitting a form remembers how far the page was scrolled, and the page it
-// comes back to starts there instead of at the top. When more needs the owner
-// than before and they are not on the tab, the icon gets a dot until they are.
+// comes back to starts there instead of at the top. The icon carries a dot for
+// as long as anything the owner has not silenced needs them.
 const LIVE_JS = `(() => {
 const here = location.pathname + location.search;
 const [path, y] = JSON.parse(sessionStorage.getItem("scroll") ?? "[]");
@@ -171,18 +174,7 @@ const tick = () => {
 };
 const script = document.currentScript, base = script.dataset.title;
 let token = script.dataset.token, pending = false, note;
-let needs = Number(script.dataset.needs), alerted = false;
 const icon = document.querySelector("link[rel=icon]");
-const away = () => document.hidden || !document.hasFocus();
-const alert = (on) => {
-	if (on === alerted) return;
-	alerted = on;
-	on ? sessionStorage.setItem("alert", "1") : sessionStorage.removeItem("alert");
-	icon.href = on ? "/favicon-alert.svg" : "/favicon.svg";
-};
-alert(!!sessionStorage.getItem("alert") && away());
-if (!alerted) sessionStorage.removeItem("alert");
-for (const type of ["pointermove", "pointerdown", "keydown", "focus"]) addEventListener(type, () => alert(false));
 const dirty = (f) => f.type === "checkbox" || f.type === "radio" ? f.checked !== f.defaultChecked
 	: f.tagName === "SELECT" ? f.selectedIndex !== Math.max(0, [...f.options].findIndex((o) => o.defaultSelected))
 	: f.type !== "hidden" && f.value !== f.defaultValue;
@@ -211,8 +203,7 @@ const poll = async () => {
 				token = state.token;
 				pending = true;
 				document.title = (state.needs ? "(" + state.needs + ") " : "") + base;
-				if (state.needs > needs && away()) alert(true);
-				needs = state.needs;
+				icon.href = state.needs ? "/favicon-alert.svg" : "/favicon.svg";
 			}
 		}
 	} catch {}
@@ -220,7 +211,7 @@ const poll = async () => {
 	apply();
 };
 setInterval(poll, 30000);
-document.addEventListener("visibilitychange", () => document.hidden || (alert(false), poll()));
+document.addEventListener("visibilitychange", () => document.hidden || poll());
 })();`;
 
 function Layout({ title, nav = true, live, children }: { title: string; nav?: boolean; live?: Live; children?: Child }) {
@@ -231,7 +222,7 @@ function Layout({ title, nav = true, live, children }: { title: string; nav?: bo
 				<meta charset="utf-8" />
 				<meta name="viewport" content="width=device-width, initial-scale=1" />
 				<title>{counted(live?.needs ?? 0, full)}</title>
-				<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+				<link rel="icon" type="image/svg+xml" href={live?.needs ? "/favicon-alert.svg" : "/favicon.svg"} />
 				<style dangerouslySetInnerHTML={{ __html: CSS }} />
 			</head>
 			<body>
@@ -247,7 +238,7 @@ function Layout({ title, nav = true, live, children }: { title: string; nav?: bo
 					</header>
 				)}
 				<main>{children}</main>
-				{live && <script data-token={live.token} data-needs={live.needs} data-title={full} dangerouslySetInnerHTML={{ __html: LIVE_JS }} />}
+				{live && <script data-token={live.token} data-title={full} dangerouslySetInnerHTML={{ __html: LIVE_JS }} />}
 			</body>
 		</html>
 	);
@@ -339,8 +330,8 @@ const SUMMARIES_SQL = `SELECT s.project_id, k.agent, s.headline, s.fields, s.upd
 
 export const ui = new Hono();
 
-// The second icon carries a red dot: the page script switches to it when
-// something new needs the owner while they are looking elsewhere.
+// The second icon carries a red dot: pages use it while anything the owner
+// has not silenced needs them.
 const favicon = (dot: string) =>
 	`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#2a5bd7"/><g fill="#fff"><circle cx="8.5" cy="10" r="2.5"/><rect x="13.5" y="8" width="12" height="4" rx="2"/><circle cx="8.5" cy="22" r="2.5"/><rect x="13.5" y="20" width="8" height="4" rx="2"/></g><path d="M5 16h22" stroke="#fff" stroke-opacity=".35" stroke-width="1.5"/>${dot}</svg>`;
 const ICONS: Record<string, string> = {
@@ -407,6 +398,7 @@ ui.get("/", async (c) => {
 							<a href={`/p/${item.project}#item-${item.id}`}>{item.title}</a>{" "}
 							<span class="muted">
 								{item.agent} · <When at={item.updated_at} />
+								{item.silenced_at && groupOf(item) === "needs" && " · silenced"}
 							</span>
 						</li>
 					))}
@@ -505,8 +497,13 @@ function ItemCard(props: { item: ItemRow; comments: CommentRow[]; history: Histo
 	const links = JSON.parse(item.links) as { label: string; url: string }[];
 	const settles = item.type === "question" || item.type === "blocker";
 	const staleWork = item.type === "working_on" && isStale(item.updated_at, props.staleHours * 60);
+	const needs = groupOf(item) === "needs";
+	const silenced = needs && !!item.silenced_at;
 	return (
-		<div class={`card ${item.archived_at ? "archived" : ""} ${groupOf(item) === "needs" ? "needs" : ""}`} id={`item-${item.id}`}>
+		<div
+			class={`card ${item.archived_at ? "archived" : ""} ${needs ? "needs" : ""} ${silenced ? "silenced" : ""}`}
+			id={`item-${item.id}`}
+		>
 			<div class="row">
 				<Badge type={item.type} />
 				{item.pinned ? <span class="badge">pinned</span> : null}
@@ -515,6 +512,7 @@ function ItemCard(props: { item: ItemRow; comments: CommentRow[]; history: Histo
 				{item.resolved_at && <span class="badge good">resolved</span>}
 				{item.answer && <span class="badge good">answered</span>}
 				{staleWork && <span class="badge bad">stale</span>}
+				{silenced && <span class="badge">silenced</span>}
 				{item.priority !== 0 && <span class="badge">priority {item.priority}</span>}
 				<strong>{item.title}</strong>
 			</div>
@@ -582,6 +580,7 @@ function ItemCard(props: { item: ItemRow; comments: CommentRow[]; history: Histo
 				{post(item.archived_at ? "unarchive" : "archive", item.archived_at ? "Restore" : "Archive")}
 				{post("pin", item.pinned ? "Unpin" : "Pin")}
 				{settles && post("resolve", item.resolved_at ? "Reopen" : "Resolve")}
+				{needs && post("silence", silenced ? "Unsilence" : "Silence")}
 			</div>
 			<details>
 				<summary class="muted">Comment</summary>
@@ -844,11 +843,20 @@ ui.post("/items/:id/pin", async (c) => {
 	return back(c, "/");
 });
 
+// Silencing is the owner's own "I will get back to this": the agent is not
+// told. It ends when the owner acts on the item or the item stops needing them.
+ui.post("/items/:id/silence", async (c) => {
+	const item = await loadItem(c.req.param("id"));
+	if (!item) return c.notFound();
+	if (needsOwner(item)) await run("UPDATE items SET silenced_at = ? WHERE id = ?", item.silenced_at ? null : now(), item.id);
+	return back(c, `/p/${item.project}`);
+});
+
 ui.post("/items/:id/resolve", async (c) => {
 	const item = await loadItem(c.req.param("id"));
 	if (!item) return c.notFound();
 	const resolving = !item.resolved_at;
-	await run("UPDATE items SET resolved_at = ? WHERE id = ?", resolving ? now() : null, item.id);
+	await run("UPDATE items SET resolved_at = ?, silenced_at = NULL WHERE id = ?", resolving ? now() : null, item.id);
 	await notify(
 		item,
 		resolving ? "resolved" : "reopened",
@@ -868,7 +876,7 @@ ui.post("/items/:id/answer", async (c) => {
 	if (selected.length || text) {
 		const labels = question.options.filter((option) => selected.includes(option.id)).map((option) => option.label);
 		await run(
-			"UPDATE items SET answer = ? WHERE id = ?",
+			"UPDATE items SET answer = ?, silenced_at = NULL WHERE id = ?",
 			JSON.stringify({ selected, labels, text, answered_at: now() }),
 			item.id,
 		);
@@ -884,7 +892,7 @@ ui.post("/items/:id/review", async (c) => {
 	const verdict = form.verdict === "overruled" ? "overruled" : "accepted";
 	const comment = typeof form.comment === "string" ? form.comment.trim().slice(0, 2000) : "";
 	await run(
-		"UPDATE items SET needs_review = 0, review = ? WHERE id = ?",
+		"UPDATE items SET needs_review = 0, review = ?, silenced_at = NULL WHERE id = ?",
 		JSON.stringify({ verdict, comment, at: now() }),
 		item.id,
 	);
