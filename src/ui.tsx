@@ -146,9 +146,13 @@ const liveState = async (): Promise<Live> => ({ token: await liveToken(), needs:
 
 const counted = (needs: number, title: string) => (needs ? `(${needs}) ${title}` : title);
 
-// Polls /live and reloads when something changed. A hidden tab only updates
-// its title, so items are not marked as seen while nobody is looking, and a
-// page with a form in use offers the reload instead of taking it. Each poll
+// Polls /live and swaps in the fresh page when something changed. A hidden tab
+// only updates its title, so items are not marked as seen while nobody is
+// looking, and a page with a form in use offers the update instead of taking
+// it. The page is swapped rather than reloaded because a browser only lets a
+// page make sound once it has been clicked, and a reload forgets the click:
+// a chime plays whenever more needs the owner than before, unless they
+// turned the sound off in the header. Each poll
 // also brings the "5m ago" stamps and the agents' stale markers up to date.
 // Submitting a form remembers how far the page was scrolled, and the page it
 // comes back to starts there instead of at the top. The icon carries a dot for
@@ -173,21 +177,62 @@ const tick = () => {
 	}
 };
 const script = document.currentScript, base = script.dataset.title;
-let token = script.dataset.token, pending = false, note;
+let token = script.dataset.token, pending = false, note, audio;
+let needs = Number(script.dataset.needs);
 const icon = document.querySelector("link[rel=icon]");
+const sound = document.querySelector("#sound");
+const muted = () => localStorage.getItem("sound") === "off";
+const chime = () => {
+	if (muted()) return;
+	audio ??= new AudioContext();
+	audio.resume();
+	for (const [pitch, delay] of [[880, 0], [1174.66, 0.13], [1760, 0.26]]) {
+		const tone = audio.createOscillator(), gain = audio.createGain(), at = audio.currentTime + delay;
+		tone.frequency.value = pitch;
+		gain.gain.setValueAtTime(0.0001, at);
+		gain.gain.exponentialRampToValueAtTime(0.2, at + 0.02);
+		gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.7);
+		tone.connect(gain).connect(audio.destination);
+		tone.start(at);
+		tone.stop(at + 0.75);
+	}
+};
+const label = () => sound.textContent = muted() ? "Sound off" : "Sound on";
+label();
+sound.onclick = () => {
+	localStorage.setItem("sound", muted() ? "on" : "off");
+	label();
+	chime();
+};
 const dirty = (f) => f.type === "checkbox" || f.type === "radio" ? f.checked !== f.defaultChecked
 	: f.tagName === "SELECT" ? f.selectedIndex !== Math.max(0, [...f.options].findIndex((o) => o.defaultSelected))
 	: f.type !== "hidden" && f.value !== f.defaultValue;
 const busy = () => /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName ?? "")
 	|| [...document.querySelectorAll("input,textarea,select")].some(dirty);
+const refresh = async () => {
+	pending = false;
+	note = void note?.remove();
+	try {
+		const response = await fetch(location.href);
+		if (!response.ok || response.redirected) return location.reload();
+		const page = new DOMParser().parseFromString(await response.text(), "text/html");
+		document.querySelector("main").replaceWith(page.querySelector("main"));
+		document.title = page.title;
+		icon.href = page.querySelector("link[rel=icon]").getAttribute("href");
+		({ token, needs } = page.querySelector("script[data-token]").dataset);
+		needs = Number(needs);
+	} catch {
+		pending = true;
+	}
+};
 const apply = () => {
 	if (!pending || document.hidden) return;
-	if (!busy()) return location.reload();
+	if (!busy()) return refresh();
 	if (note) return;
 	note = document.createElement("button");
 	note.className = "live";
-	note.textContent = "New updates · reload";
-	note.onclick = () => location.reload();
+	note.textContent = "New updates · show";
+	note.onclick = refresh;
 	document.body.append(note);
 };
 const poll = async () => {
@@ -204,11 +249,13 @@ const poll = async () => {
 				pending = true;
 				document.title = (state.needs ? "(" + state.needs + ") " : "") + base;
 				icon.href = state.needs ? "/favicon-alert.svg" : "/favicon.svg";
+				if (state.needs > needs) chime();
+				needs = state.needs;
 			}
 		}
 	} catch {}
+	await apply();
 	tick();
-	apply();
 };
 setInterval(poll, 30000);
 document.addEventListener("visibilitychange", () => document.hidden || poll());
@@ -232,13 +279,14 @@ function Layout({ title, nav = true, live, children }: { title: string; nav?: bo
 						<a href="/">Overview</a>
 						<a href="/keys">Projects &amp; keys</a>
 						<a href="/docs">API docs</a>
+						{live && <button class="link" id="sound" title="Chime when something new needs you" />}
 						<form method="post" action="/logout">
 							<button class="link">Log out</button>
 						</form>
 					</header>
 				)}
 				<main>{children}</main>
-				{live && <script data-token={live.token} data-title={full} dangerouslySetInnerHTML={{ __html: LIVE_JS }} />}
+				{live && <script data-token={live.token} data-needs={live.needs} data-title={full} dangerouslySetInnerHTML={{ __html: LIVE_JS }} />}
 			</body>
 		</html>
 	);

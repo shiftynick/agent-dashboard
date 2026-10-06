@@ -415,7 +415,9 @@ test("the dashboard notices agent updates and counts what needs the owner", asyn
 	assert.equal(after.needs, before.needs! + 1);
 	const html = await page();
 	assert.equal(count(html), after.needs);
-	assert.match(html, /<script data-token="[0-9a-f]{16}"/);
+	// The page script chimes when this count goes up, and swaps the page in place.
+	assert.match(html, new RegExp(`<script data-token="[0-9a-f]{16}" data-needs="${after.needs}"`));
+	assert.match(html, /<button class="link" id="sound"/);
 	const icons = await Promise.all(["/favicon.svg", "/favicon-alert.svg"].map((path) => fetch(BASE + path).then((r) => r.text())));
 	assert.ok(icons.every((icon) => icon.startsWith("<svg")) && icons[0] !== icons[1]);
 
