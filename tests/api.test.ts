@@ -117,6 +117,8 @@ test("1. the owner answers a question with options, and can change the answer", 
 	assert.equal(question.json.options.length, 3);
 	const html = await page();
 	assert.ok(html.includes("Option A") && html.includes("recommended"));
+	// Enter in the "other" box presses the form's first button, which must not be a choice.
+	assert.match(html, new RegExp(`action="/items/${question.json.id}/answer"[^>]*><button hidden=""></button>`));
 	assert.ok(html.indexOf(`id="item-${question.json.id}"`) < html.indexOf('id="group-working_on"') || !html.includes('id="group-working_on"'));
 
 	await owner(`/items/${question.json.id}/answer`, { selected: "b", text: "but keep A as fallback" });

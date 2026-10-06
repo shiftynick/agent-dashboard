@@ -503,6 +503,8 @@ function QuestionForm({ item }: { item: ItemRow }) {
 	const chosen = (id: string) => answer?.selected.includes(id) ?? false;
 	return (
 		<form method="post" action={`/items/${item.id}/answer`} class="ask stack">
+			{/* Enter in the text box presses a form's first button, which would otherwise be the first choice. */}
+			{!question.multi && question.allow_other && <button hidden />}
 			{answer && (
 				<div class="muted">
 					You answered <When at={answer.answered_at} />. Choosing again changes the answer.
